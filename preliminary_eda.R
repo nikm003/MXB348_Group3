@@ -1,6 +1,6 @@
 
 ##load cleaned data
-source("data_cleaning.R")
+source("clean_attribution_data.R")
 journey_full <- clean_attribution_data("customer_journey-4.csv", "results-3.csv")
 
 library(ggplot2)
