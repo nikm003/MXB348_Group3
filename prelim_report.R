@@ -587,3 +587,242 @@ p2 <- ggplot(by_len_long, aes(x=len_bucket, y=pct, color=channel, group=channel)
 ggsave(FIG("attribution_by_length.png"), p2, width=8, height=5, dpi=150)
 
 cat("\nALL DONE. Check the 'outputs' and 'figs' subfolders inside:\n", BASE_DIR, "\n")
+
+
+
+
+
+
+
+
+
+# MODEL 1 (FINAL) - predicting conversion on return visits
+
+suppressMessages({ library(dplyr); library(tidyr) })
+if (!requireNamespace("xgboost", quietly = TRUE)) install.packages("xgboost")
+
+
+# Helpers
+
+# AUC via the Mann-Whitney identity. as.numeric() avoids integer overflow,
+# which broke the original auc_manual() on large training sets.
+auc_fast <- function(labels, scores) {
+  pos <- scores[labels == 1]; neg <- scores[labels == 0]
+  n1 <- as.numeric(length(pos)); n0 <- as.numeric(length(neg))
+  r  <- rank(c(pos, neg))
+  (sum(r[seq_len(n1)]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+
+channels <- sort(unique(journey_full$channel))
+ch_cols  <- make.names(channels)        # "Email Marketing" -> "Email.Marketing"
+
+
+# One row per session: current-session features
+
+sess <- journey_full %>%
+  arrange(user_id, session_id, touch_order) %>%
+  group_by(user_id, session_id) %>%
+  summarise(conversion    = first(conversion),
+            n_touches     = n(),
+            entry_channel = first(channel),
+            last_channel  = last(channel),
+            duration      = max(time_till_session_end),         # span of the session
+            n_distinct_ch = n_distinct(channel),
+            # gaps between consecutive touches (times count DOWN to session end, hence the minus)
+            max_gap       = if (n() > 1) max(-diff(time_till_session_end)) else 0,
+            mean_gap      = if (n() > 1) mean(-diff(time_till_session_end)) else 0,
+            .groups = "drop") %>%
+  mutate(n_repeats = n_touches - n_distinct_ch)                 # touches on already-seen channels
+
+# touches per channel in each session (wide); used for history shares and "has_" flags
+counts <- journey_full %>%
+  count(user_id, session_id, channel) %>%
+  pivot_wider(names_from = channel, values_from = n, values_fill = 0) %>%
+  rename_with(make.names, all_of(channels))
+
+sess <- sess %>%
+  left_join(counts, by = c("user_id", "session_id")) %>%
+  # has_<channel> = 1 if the channel appears anywhere in this session's path
+  mutate(across(all_of(ch_cols), ~ as.integer(.x > 0), .names = "has_{.col}"))
+has_cols <- paste0("has_", ch_cols)
+
+# shaped timing features (duration/gap effects are non-monotonic: see report tables)
+sess <- sess %>% mutate(
+  dur_bin  = cut(duration, c(-Inf, 0, 48, 96, 192, 288, 480, Inf)),  # 0 = single-touch sessions
+  gap_zero = as.integer(max_gap == 0),
+  lmax     = log1p(max_gap),
+  lmean    = log1p(mean_gap)
+)
+
+
+# 2. Per-user HISTORY features (only strictly earlier sessions)
+
+# NOTE: these global means are computed on all sessions (incl. future test users).
+# The effect is negligible.
+p0      <- mean(sess$conversion)     # global conversion rate (starting value / smoothing prior)
+mean_tc <- mean(sess$n_touches)
+mean_du <- mean(sess$duration)
+
+# exponentially weighted average of x over PREVIOUS sessions (value before session t)
+# higher alpha = more weight on the most recent session
+ewma_prior <- function(x, alpha, init) {
+  out <- numeric(length(x)); e <- init
+  for (t in seq_along(x)) { out[t] <- e; e <- alpha * x[t] + (1 - alpha) * e }
+  out
+}
+# sessions since the user's last conversion (0 = previous session converted; 10 = never/capped)
+since_prior <- function(conv) {
+  out <- numeric(length(conv)); s <- 10
+  for (t in seq_along(conv)) { out[t] <- s; s <- if (conv[t] == 1) 0 else min(s + 1, 10) }
+  out
+}
+
+sess <- sess %>%
+  arrange(user_id, session_id) %>%
+  group_by(user_id) %>%
+  mutate(
+    visit_number   = row_number(),
+    prior_sessions = visit_number - 1,
+    
+    # ---- baseline features (your original Model 1 feature set) ----
+    prior_conv_rate    = ifelse(prior_sessions > 0,
+                                lag(cumsum(conversion), default = 0) / prior_sessions, NA_real_),
+    prior_avg_touches  = lag(cummean(n_touches), default = NA_real_),
+    prior_avg_duration = lag(cummean(duration),  default = NA_real_),
+    across(all_of(ch_cols),                      # share of prior touches per channel
+           ~ lag(cumsum(.x), default = 0) / pmax(prior_sessions, 1),
+           .names = "prior_{.col}_share"),
+    
+    # ---- new recency / history features ----
+    ewma_conv_02 = ewma_prior(conversion, 0.2, p0),   # slow decay
+    ewma_conv_05 = ewma_prior(conversion, 0.5, p0),
+    ewma_conv_08 = ewma_prior(conversion, 0.8, p0),   # fast decay (strongest single signal)
+    last_converted      = lag(conversion, default = 0),
+    sessions_since_conv = since_prior(conversion),
+    conv_smooth   = (lag(cumsum(conversion), default = 0) + 2 * p0) / (prior_sessions + 2),
+    ewma_touches  = ewma_prior(n_touches, 0.5, mean_tc),
+    ewma_duration = ewma_prior(duration,  0.5, mean_du)
+  ) %>%
+  ungroup() %>%
+  mutate(entry_channel = factor(entry_channel),
+         last_channel  = factor(last_channel),
+         conversion    = as.integer(conversion))
+
+# return visits only: need at least one earlier session to have history
+d     <- sess %>% filter(visit_number >= 2)
+users <- unique(d$user_id)
+cat("Return-visit rows:", nrow(d), " Users:", length(users),
+    " Conversion rate:", round(mean(d$conversion), 4), "\n")
+
+
+# Feature sets
+
+# baseline = original features (Youtube share dropped: shares sum to 1 -> collinear)
+share_vars    <- setdiff(paste0("prior_", ch_cols, "_share"), "prior_Youtube_share")
+baseline_vars <- c("visit_number", "prior_conv_rate", "prior_avg_touches", "prior_avg_duration",
+                   "entry_channel", share_vars)
+
+# START = known when the session begins (a genuine forecast)
+hist_vars  <- c("visit_number", "ewma_conv_02", "ewma_conv_05", "ewma_conv_08",
+                "last_converted", "sessions_since_conv", "conv_smooth",
+                "ewma_touches", "ewma_duration")
+start_vars <- c(hist_vars, "entry_channel")
+
+# END = also uses the current session (describes conversion; NOT a forecast)
+end_vars <- c(start_vars, "n_touches", "duration", "n_distinct_ch", "n_repeats",
+              "max_gap", "mean_gap", "last_channel", has_cols)
+
+# glm version of END: drop exactly collinear columns (n_repeats, one has_ flag)
+# and use shaped timing terms so the linear model can capture the U-shape
+end_curve_vars <- c(setdiff(end_vars, c("n_repeats", has_cols[length(has_cols)],
+                                        "duration", "max_gap", "mean_gap")),
+                    "dur_bin", "gap_zero", "lmax", "I(lmax^2)", "lmean", "I(lmean^2)")
+# glm version of plain END (linear terms), also collinearity-safe
+end_glm_vars <- setdiff(end_vars, c("n_repeats", has_cols[length(has_cols)]))
+
+
+# Model functions (each returns test AUC)
+
+glm_auc <- function(vars, tr, te) {
+  fit <- glm(reformulate(vars, "conversion"), data = tr, family = binomial())
+  p   <- predict(fit, newdata = te, type = "response")
+  ok  <- !is.na(p)
+  auc_fast(te$conversion[ok], p[ok])
+}
+
+xgb_params <- list(objective = "binary:logistic", eta = 0.05, max_depth = 3,
+                   subsample = 0.8, colsample_bytree = 0.8,
+                   min_child_weight = 20, tree_method = "hist")
+to_matrix <- function(df, vars)                    # factors -> dummy columns for xgboost
+  model.matrix(~ . - 1, model.frame(~ ., df[vars], na.action = na.pass))
+
+xgb_auc <- function(vars, tr, te) {
+  dtr <- xgboost::xgb.DMatrix(to_matrix(tr, vars), label = tr$conversion)
+  dte <- xgboost::xgb.DMatrix(to_matrix(te, vars), label = te$conversion)
+  m   <- xgboost::xgb.train(params = xgb_params, data = dtr, nrounds = 200, verbose = 0)
+  auc_fast(te$conversion, predict(m, dte))
+}
+
+
+# Repeated USER-LEVEL splits (no user appears in both train and test)
+
+n_rep <- 5
+model_names <- c("glm_baseline", "glm_start", "glm_end", "glm_end_curve", "xgb_start", "xgb_end")
+res <- matrix(NA_real_, n_rep, length(model_names), dimnames = list(NULL, model_names))
+
+for (r in seq_len(n_rep)) {
+  t0 <- Sys.time(); set.seed(r)
+  tr_u <- sample(users, floor(0.8 * length(users)))          # 80% of USERS for training
+  tr <- d[d$user_id %in% tr_u, ]; te <- d[!d$user_id %in% tr_u, ]
+  res[r, "glm_baseline"]  <- glm_auc(baseline_vars,  tr, te)
+  res[r, "glm_start"]     <- glm_auc(start_vars,     tr, te)
+  res[r, "glm_end"]       <- glm_auc(end_glm_vars,   tr, te)
+  res[r, "glm_end_curve"] <- glm_auc(end_curve_vars, tr, te)
+  res[r, "xgb_start"]     <- xgb_auc(start_vars,     tr, te)
+  res[r, "xgb_end"]       <- xgb_auc(end_vars,       tr, te)
+  cat("split", r, "of", n_rep, "done in",
+      round(as.numeric(difftime(Sys.time(), t0, units = "secs"))), "sec\n")
+}
+
+# main results table for the report (paired difference is computed within each split)
+res_table <- data.frame(
+  model              = model_names,
+  uses_current_sess  = c("no", "no", "yes", "yes", "no", "yes"),
+  mean_auc           = round(colMeans(res), 4),
+  sd_auc             = round(apply(res, 2, sd), 4),
+  change_vs_baseline = round(colMeans(res - res[, "glm_baseline"]), 4),
+  beats_baseline_pct = round(100 * colMeans(res > res[, "glm_baseline"]))
+)
+print(res_table, row.names = FALSE)
+
+
+# Features boosted model use
+
+set.seed(1)
+tr_u <- sample(users, floor(0.8 * length(users))); tr <- d[d$user_id %in% tr_u, ]
+m_imp <- xgboost::xgb.train(params = xgb_params, nrounds = 200, verbose = 0,
+                            data = xgboost::xgb.DMatrix(to_matrix(tr, end_vars), label = tr$conversion))
+importance_table <- head(xgboost::xgb.importance(model = m_imp), 15)   # Gain = share of improvement
+print(importance_table)
+
+# Descriptive evidence
+
+# conversion rate by number of touches in the session (8 = "8 or more")
+touch_table <- d %>% mutate(touches = pmin(n_touches, 8)) %>%
+  group_by(touches) %>% summarise(conv_rate = round(mean(conversion), 4), n = n())
+print(touch_table)
+
+# conversion by average gap between touches, within journey-length groups
+# (gap values appear to be in hours - CONFIRM the unit in your data documentation)
+gap_table <- d %>% filter(n_touches >= 2) %>%
+  mutate(gap_quintile = ntile(mean_gap, 5),
+         touch_group  = cut(n_touches, c(1, 2, 4, Inf), labels = c("2", "3-4", "5+"))) %>%
+  group_by(touch_group, gap_quintile) %>%
+  summarise(min_gap = min(mean_gap), conv_rate = round(mean(conversion), 4), n = n(), .groups = "drop")
+print(gap_table, n = 15)
+
+# Optional: save tables for the report
+# write.csv(res_table,        OUT("model1_final_results.csv"),    row.names = FALSE)
+# write.csv(importance_table, OUT("model1_importance.csv"),       row.names = FALSE)
+# write.csv(touch_table,      OUT("model1_touch_table.csv"),      row.names = FALSE)
+# write.csv(gap_table,        OUT("model1_gap_table.csv"),        row.names = FALSE)
