@@ -9,7 +9,7 @@ OUT  <- function(f) file.path(BASE_DIR, "outputs", f)
 FIG  <- function(f) file.path(BASE_DIR, "figs", f)
 DATA <- function(f) file.path(BASE_DIR, f)   # for saved .rds intermediates
 
-# ---- 0. Install/load required packages ----
+# Install/load required packages
 required_pkgs <- c("readxl", "dplyr", "tidyr", "ggplot2", "MASS", "car")
 for (pkg in required_pkgs) {
   if (!requireNamespace(pkg, quietly = TRUE)) install.packages(pkg)
@@ -74,7 +74,7 @@ cat("\nShare of users with 1 vs 2+ sessions:\n")
 print(table(cut(sessions_per_user$n_sessions, breaks=c(0,1,Inf), labels=c("1 session","2+ sessions"))))
 sink()
 
-# --- channel volume: which channels get the most touchpoints ---
+# Channel volume: which channels get the most touchpoints
 channel_volume <- journey_full %>% count(channel, name="touchpoints") %>% arrange(desc(touchpoints))
 write.csv(channel_volume, OUT("channel_volume.csv"), row.names = FALSE)
 
@@ -84,7 +84,7 @@ p1 <- ggplot(channel_volume, aes(x = reorder(channel, touchpoints), y = touchpoi
   theme_minimal(base_size = 12)
 ggsave(FIG("channel_volume.png"), p1, width=7, height=4.5, dpi=150)
 
-# --- path length: how many touches a typical session has ---
+# Path length: how many touches a typical session has
 path_length <- journey_full %>%
   count(user_id, session_id, name = "n_touches") %>%
   mutate(bucket = if_else(n_touches >= 8, "8+", as.character(n_touches))) %>%
@@ -98,7 +98,7 @@ p2 <- ggplot(path_length, aes(x = bucket, y = sessions)) +
   theme_minimal(base_size = 12)
 ggsave(FIG("path_length.png"), p2, width=7, height=4.5, dpi=150)
 
-# --- does conversion rate differ by whether a channel is first vs last touch? ---
+# Does conversion rate differ by whether a channel is first vs last touch? ---
 first_touch <- journey_full %>% group_by(user_id, session_id) %>% filter(touch_order == min(touch_order)) %>% ungroup() %>%
   group_by(channel) %>% summarise(conversion_rate = mean(conversion), n=n(), .groups="drop") %>% mutate(position="First touch")
 last_touch <- journey_full %>% group_by(user_id, session_id) %>% filter(touch_order == max(touch_order)) %>% ungroup() %>%
@@ -123,121 +123,253 @@ ggsave(FIG("sessions_per_user.png"), p4, width=7, height=4.5, dpi=150)
 cat("EDA done\n")
 
 
-# MODEL 1 — feature engineering: return-visit conversion
-# journey_full already in memory from Section 1 - no need to reload
+# MODEL 1 (FINAL) - predicting conversion on return visits
 
-# collapse touch-level data down to one row per session
-session_level <- journey_full %>%
-  group_by(user_id, session_id) %>%
-  summarise(
-    conversion = first(conversion),
-    n_touches = n(),
-    entry_channel = channel[touch_order == 0],       # channel that started this session
-    session_duration = max(time_till_session_end),
-    .groups = "drop"
-  ) %>%
-  arrange(user_id, session_id)
+suppressMessages({ library(dplyr); library(tidyr) })
+if (!requireNamespace("xgboost", quietly = TRUE)) install.packages("xgboost")
 
-# touch counts per channel per session (wide), used to build historical channel-mix features
-channel_counts <- journey_full %>%
-  count(user_id, session_id, channel) %>%
-  pivot_wider(names_from = channel, values_from = n, values_fill = 0)
 
-session_level <- session_level %>% left_join(channel_counts, by = c("user_id","session_id"))
-channels <- c("Direct","Email Marketing","Facebook","Google Display","Google Search","Instagram","Organic","Youtube")
+# Helpers
 
-session_level <- session_level %>% arrange(user_id, session_id)
-
-# builds "prior_*" features per user using ONLY strictly earlier sessions (avoids information leakage)
-build_prior <- function(df) {
-  df <- df %>% arrange(session_id)
-  n <- nrow(df)
-  df$visit_number <- seq_len(n)
-  df$prior_sessions <- seq_len(n) - 1
-  # lag(cumsum(...)) shifts the running total back by one row, so session N only sees sessions 1..N-1
-  df$prior_conversions <- lag(cumsum(df$conversion), default = 0)
-  df$prior_conv_rate <- ifelse(df$prior_sessions > 0, df$prior_conversions / df$prior_sessions, NA_real_)
-  df$prior_avg_touches <- lag(cummean(df$n_touches), default = NA_real_)
-  df$prior_avg_duration <- lag(cummean(df$session_duration), default = NA_real_)
-  for (ch in channels) {
-    cs <- cumsum(df[[ch]])
-    df[[paste0("prior_", make.names(ch), "_share")]] <- lag(cs, default = 0) / pmax(df$prior_sessions, 1)
-  }
-  df
+# AUC via the Mann-Whitney identity. as.numeric() avoids integer overflow,
+# which broke the original auc_manual() on large training sets.
+auc_fast <- function(labels, scores) {
+  pos <- scores[labels == 1]; neg <- scores[labels == 0]
+  n1 <- as.numeric(length(pos)); n0 <- as.numeric(length(neg))
+  r  <- rank(c(pos, neg))
+  (sum(r[seq_len(n1)]) - n1 * (n1 + 1) / 2) / (n1 * n0)
 }
 
-session_level <- session_level %>% group_by(user_id) %>% group_modify(~ build_prior(.x)) %>% ungroup()
-
-# only 2nd+ visits qualify as "return visits" (need at least one prior session to build prior_* features)
-return_visits <- session_level %>% filter(visit_number >= 2)
-
-cat("Return-visit rows:", nrow(return_visits), "\n")
-cat("Conversion rate among return visits:", round(mean(return_visits$conversion),4), "\n")
-
-write.csv(head(return_visits, 200), OUT("model1_features_preview.csv"), row.names=FALSE)
+channels <- sort(unique(journey_full$channel))
+ch_cols  <- make.names(channels)        # "Email Marketing" -> "Email.Marketing"
 
 
-# MODEL 1 — fit logistic regression
+# One row per session: current-session features
 
-set.seed(42)
-d <- return_visits %>% mutate(
-  entry_channel = factor(entry_channel),
-  conversion = as.integer(conversion)
+sess <- journey_full %>%
+  arrange(user_id, session_id, touch_order) %>%
+  group_by(user_id, session_id) %>%
+  summarise(conversion    = first(conversion),
+            n_touches     = n(),
+            entry_channel = first(channel),
+            last_channel  = last(channel),
+            duration      = max(time_till_session_end),         # span of the session
+            n_distinct_ch = n_distinct(channel),
+            # gaps between consecutive touches (times count DOWN to session end, hence the minus)
+            max_gap       = if (n() > 1) max(-diff(time_till_session_end)) else 0,
+            mean_gap      = if (n() > 1) mean(-diff(time_till_session_end)) else 0,
+            .groups = "drop") %>%
+  mutate(n_repeats = n_touches - n_distinct_ch)                 # touches on already-seen channels
+
+# touches per channel in each session (wide); used for history shares and "has_" flags
+counts <- journey_full %>%
+  count(user_id, session_id, channel) %>%
+  pivot_wider(names_from = channel, values_from = n, values_fill = 0) %>%
+  rename_with(make.names, all_of(channels))
+
+sess <- sess %>%
+  left_join(counts, by = c("user_id", "session_id")) %>%
+  # has_<channel> = 1 if the channel appears anywhere in this session's path
+  mutate(across(all_of(ch_cols), ~ as.integer(.x > 0), .names = "has_{.col}"))
+has_cols <- paste0("has_", ch_cols)
+
+# shaped timing features (duration/gap effects are non-monotonic: see report tables)
+sess <- sess %>% mutate(
+  dur_bin  = cut(duration, c(-Inf, 0, 48, 96, 192, 288, 480, Inf)),  # 0 = single-touch sessions
+  gap_zero = as.integer(max_gap == 0),
+  lmax     = log1p(max_gap),
+  lmean    = log1p(mean_gap)
 )
 
-n <- nrow(d)
-train_idx <- sample(seq_len(n), size = floor(0.8*n))   # 80/20 train/test split
-train <- d[train_idx, ]
-test  <- d[-train_idx, ]
 
-form <- conversion ~ visit_number + prior_conv_rate + prior_avg_touches + prior_avg_duration +
-  entry_channel + prior_Direct_share + prior_Email.Marketing_share + prior_Facebook_share +
-  prior_Google.Display_share + prior_Google.Search_share + prior_Instagram_share +
-  prior_Organic_share
-# prior_Youtube_share omitted as reference level (8 shares sum to 1 -> drop one to avoid perfect collinearity)
+# Per-user HISTORY features (only strictly earlier sessions)
 
-fit <- glm(form, data = train, family = binomial())   # logistic regression
+# NOTE: these global means are computed on all sessions (incl. future test users).
+# The effect is negligible.
+p0      <- mean(sess$conversion)     # global conversion rate (starting value / smoothing prior)
+mean_tc <- mean(sess$n_touches)
+mean_du <- mean(sess$duration)
 
-sink(OUT("model1_summary.txt"))
-print(summary(fit))
-cat("\n\nVIF check (values > 5 flag concerning multicollinearity):\n")
-vif_vals <- tryCatch(car::vif(fit), error = function(e) NULL)
-if (!is.null(vif_vals)) print(vif_vals) else cat("car::vif failed (likely aliased coefficients)\n")
-sink()
+# exponentially weighted average of x over PREVIOUS sessions (value before session t)
+# higher alpha = more weight on the most recent session
+ewma_prior <- function(x, alpha, init) {
+  out <- numeric(length(x)); e <- init
+  for (t in seq_along(x)) { out[t] <- e; e <- alpha * x[t] + (1 - alpha) * e }
+  out
+}
+# sessions since the user's last conversion (0 = previous session converted; 10 = never/capped)
+since_prior <- function(conv) {
+  out <- numeric(length(conv)); s <- 10
+  for (t in seq_along(conv)) { out[t] <- s; s <- if (conv[t] == 1) 0 else min(s + 1, 10) }
+  out
+}
 
+sess <- sess %>%
+  arrange(user_id, session_id) %>%
+  group_by(user_id) %>%
+  mutate(
+    visit_number   = row_number(),
+    prior_sessions = visit_number - 1,
+    
+    # ---- baseline features (your original Model 1 feature set) ----
+    prior_conv_rate    = ifelse(prior_sessions > 0,
+                                lag(cumsum(conversion), default = 0) / prior_sessions, NA_real_),
+    prior_avg_touches  = lag(cummean(n_touches), default = NA_real_),
+    prior_avg_duration = lag(cummean(duration),  default = NA_real_),
+    across(all_of(ch_cols),                      # share of prior touches per channel
+           ~ lag(cumsum(.x), default = 0) / pmax(prior_sessions, 1),
+           .names = "prior_{.col}_share"),
+    
+    # new recency / history features
+    ewma_conv_02 = ewma_prior(conversion, 0.2, p0),   # slow decay
+    ewma_conv_05 = ewma_prior(conversion, 0.5, p0),
+    ewma_conv_08 = ewma_prior(conversion, 0.8, p0),   # fast decay (strongest single signal)
+    last_converted      = lag(conversion, default = 0),
+    sessions_since_conv = since_prior(conversion),
+    conv_smooth   = (lag(cumsum(conversion), default = 0) + 2 * p0) / (prior_sessions + 2),
+    ewma_touches  = ewma_prior(n_touches, 0.5, mean_tc),
+    ewma_duration = ewma_prior(duration,  0.5, mean_du)
+  ) %>%
+  ungroup() %>%
+  mutate(entry_channel = factor(entry_channel),
+         last_channel  = factor(last_channel),
+         conversion    = as.integer(conversion))
+
+# return visits only: need at least one earlier session to have history
+d     <- sess %>% filter(visit_number >= 2)
+users <- unique(d$user_id)
+cat("Return-visit rows:", nrow(d), " Users:", length(users),
+    " Conversion rate:", round(mean(d$conversion), 4), "\n")
+
+
+# Feature sets
+
+# baseline = original features (Youtube share dropped: shares sum to 1 -> collinear)
+share_vars    <- setdiff(paste0("prior_", ch_cols, "_share"), "prior_Youtube_share")
+baseline_vars <- c("visit_number", "prior_conv_rate", "prior_avg_touches", "prior_avg_duration",
+                   "entry_channel", share_vars)
+
+# START = known when the session begins (a genuine forecast)
+hist_vars  <- c("visit_number", "ewma_conv_02", "ewma_conv_05", "ewma_conv_08",
+                "last_converted", "sessions_since_conv", "conv_smooth",
+                "ewma_touches", "ewma_duration")
+start_vars <- c(hist_vars, "entry_channel")
+
+# END = also uses the current session (describes conversion; NOT a forecast)
+end_vars <- c(start_vars, "n_touches", "duration", "n_distinct_ch", "n_repeats",
+              "max_gap", "mean_gap", "last_channel", has_cols)
+
+# glm version of END: drop exactly collinear columns (n_repeats, one has_ flag)
+# and use shaped timing terms so the linear model can capture the U-shape
+end_curve_vars <- c(setdiff(end_vars, c("n_repeats", has_cols[length(has_cols)],
+                                        "duration", "max_gap", "mean_gap")),
+                    "dur_bin", "gap_zero", "lmax", "I(lmax^2)", "lmean", "I(lmean^2)")
+# glm version of plain END (linear terms), also collinearity-safe
+end_glm_vars <- setdiff(end_vars, c("n_repeats", has_cols[length(has_cols)]))
+
+
+# Model functions (each returns test AUC)
+
+glm_auc <- function(vars, tr, te) {
+  fit <- glm(reformulate(vars, "conversion"), data = tr, family = binomial())
+  p   <- predict(fit, newdata = te, type = "response")
+  ok  <- !is.na(p)
+  auc_fast(te$conversion[ok], p[ok])
+}
+
+xgb_params <- list(objective = "binary:logistic", eta = 0.05, max_depth = 3,
+                   subsample = 0.8, colsample_bytree = 0.8,
+                   min_child_weight = 20, tree_method = "hist")
+to_matrix <- function(df, vars)                    # factors -> dummy columns for xgboost
+  model.matrix(~ . - 1, model.frame(~ ., df[vars], na.action = na.pass))
+
+xgb_auc <- function(vars, tr, te) {
+  dtr <- xgboost::xgb.DMatrix(to_matrix(tr, vars), label = tr$conversion)
+  dte <- xgboost::xgb.DMatrix(to_matrix(te, vars), label = te$conversion)
+  m   <- xgboost::xgb.train(params = xgb_params, data = dtr, nrounds = 200, verbose = 0)
+  auc_fast(te$conversion, predict(m, dte))
+}
+
+
+# Repeated USER-LEVEL splits (no user appears in both train and test)
+
+n_rep <- 5
+model_names <- c("glm_baseline", "glm_start", "glm_end", "glm_end_curve", "xgb_start", "xgb_end")
+res <- matrix(NA_real_, n_rep, length(model_names), dimnames = list(NULL, model_names))
+
+for (r in seq_len(n_rep)) {
+  t0 <- Sys.time(); set.seed(r)
+  tr_u <- sample(users, floor(0.8 * length(users)))          # 80% of USERS for training
+  tr <- d[d$user_id %in% tr_u, ]; te <- d[!d$user_id %in% tr_u, ]
+  res[r, "glm_baseline"]  <- glm_auc(baseline_vars,  tr, te)
+  res[r, "glm_start"]     <- glm_auc(start_vars,     tr, te)
+  res[r, "glm_end"]       <- glm_auc(end_glm_vars,   tr, te)
+  res[r, "glm_end_curve"] <- glm_auc(end_curve_vars, tr, te)
+  res[r, "xgb_start"]     <- xgb_auc(start_vars,     tr, te)
+  res[r, "xgb_end"]       <- xgb_auc(end_vars,       tr, te)
+  cat("split", r, "of", n_rep, "done in",
+      round(as.numeric(difftime(Sys.time(), t0, units = "secs"))), "sec\n")
+}
+
+# main results table for the report (paired difference is computed within each split)
+res_table <- data.frame(
+  model              = model_names,
+  uses_current_sess  = c("no", "no", "yes", "yes", "no", "yes"),
+  mean_auc           = round(colMeans(res), 4),
+  sd_auc             = round(apply(res, 2, sd), 4),
+  change_vs_baseline = round(colMeans(res - res[, "glm_baseline"]), 4),
+  beats_baseline_pct = round(100 * colMeans(res > res[, "glm_baseline"]))
+)
+print(res_table, row.names = FALSE)
+
+
+# Features boosted model use
+
+set.seed(1)
+tr_u <- sample(users, floor(0.8 * length(users))); tr <- d[d$user_id %in% tr_u, ]
+m_imp <- xgboost::xgb.train(params = xgb_params, nrounds = 200, verbose = 0,
+                            data = xgboost::xgb.DMatrix(to_matrix(tr, end_vars), label = tr$conversion))
+importance_table <- head(xgboost::xgb.importance(model = m_imp), 15)   # Gain = share of improvement
+print(importance_table)
+
+# Descriptive evidence
+
+# conversion rate by number of touches in the session (8 = "8 or more")
+touch_table <- d %>% mutate(touches = pmin(n_touches, 8)) %>%
+  group_by(touches) %>% summarise(conv_rate = round(mean(conversion), 4), n = n())
+print(touch_table)
+
+# conversion by average gap between touches, within journey-length groups
+# (gap values appear to be in hours - CONFIRM the unit in your data documentation)
+gap_table <- d %>% filter(n_touches >= 2) %>%
+  mutate(gap_quintile = ntile(mean_gap, 5),
+         touch_group  = cut(n_touches, c(1, 2, 4, Inf), labels = c("2", "3-4", "5+"))) %>%
+  group_by(touch_group, gap_quintile) %>%
+  summarise(min_gap = min(mean_gap), conv_rate = round(mean(conversion), 4), n = n(), .groups = "drop")
+print(gap_table, n = 15)
+
+set.seed(42); tr_u <- sample(users, floor(0.8 * length(users)))
+train <- d[d$user_id %in% tr_u, ]; test <- d[!d$user_id %in% tr_u, ]
+fit <- glm(reformulate(start_vars, "conversion"), data = train, family = binomial())
 test$pred_prob <- predict(fit, newdata = test, type = "response")
 
-# manual AUC via Mann-Whitney U statistic on ranks (no extra package needed)
-auc_manual <- function(labels, scores) {
-  pos <- scores[labels == 1]; neg <- scores[labels == 0]
-  n1 <- length(pos); n0 <- length(neg)
-  r <- rank(c(pos, neg))
-  (sum(r[1:n1]) - n1*(n1+1)/2) / (n1*n0)
-}
-auc_val <- auc_manual(test$conversion, test$pred_prob)
+auc_single   <- auc_fast(test$conversion, test$pred_prob)
+brier_model  <- mean((test$pred_prob - test$conversion)^2)
+brier_base   <- mean((mean(train$conversion) - test$conversion)^2)    # always predict the training rate
+cat("AUC:", round(auc_single, 4), "\n")
+cat("Brier model:", round(brier_model, 4), " baseline:", round(brier_base, 4), "\n")
 
-# calibration check: do predicted probabilities match actual outcome rates within each decile?
-test <- test %>% mutate(decile = ntile(pred_prob, 10))
-calib <- test %>% group_by(decile) %>% summarise(mean_pred = mean(pred_prob), mean_actual = mean(conversion), n=n())
-write.csv(calib, OUT("model1_calibration.csv"), row.names = FALSE)
+single_perf <- data.frame(auc = round(auc_single, 4), brier_model = round(brier_model, 4),
+                          brier_baseline = round(brier_base, 4))
+calib_final <- test %>% mutate(decile = ntile(pred_prob, 10)) %>% group_by(decile) %>%
+  summarise(mean_pred = mean(pred_prob), mean_actual = mean(conversion), n = n())
+coef_table  <- data.frame(term = rownames(summary(fit)$coefficients),
+                          round(summary(fit)$coefficients, 4), row.names = NULL)
+print(calib_final); print(summary(fit))
 
-# Brier score vs a naive baseline (always predict the overall rate) - is the model actually adding value?
-baseline_rate <- mean(train$conversion)
-brier_model <- mean((test$pred_prob - test$conversion)^2)
-brier_baseline <- mean((baseline_rate - test$conversion)^2)
-
-cat("AUC:", round(auc_val,4), "\n")
-cat("Brier (model):", round(brier_model,4), " Brier (baseline):", round(brier_baseline,4), "\n")
-
-sink(OUT("model1_performance.txt"))
-cat("Test AUC:", round(auc_val,4), "\n")
-cat("Test Brier score (model):", round(brier_model,4), "\n")
-cat("Test Brier score (naive baseline = overall rate):", round(brier_baseline,4), "\n")
-cat("Baseline (train) conversion rate used:", round(baseline_rate,4), "\n")
-sink()
-
-saveRDS(fit, DATA("model1_fit.rds"))   # keep the fitted model so it can be reloaded without refitting
-
+write.csv(single_perf, OUT("model1_single_performance.csv"), row.names = FALSE)
+write.csv(calib_final, OUT("model1_calibration.csv"),        row.names = FALSE)
+write.csv(coef_table,  OUT("model1_coefficients.csv"),       row.names = FALSE)
 
 # MODEL 2 — feature engineering: steps to conversion
 
@@ -286,8 +418,9 @@ set.seed(42)
 
 d <- model2_df
 n <- nrow(d)
-train_idx <- sample(seq_len(n), floor(0.8*n))
-train <- d[train_idx,]; test <- d[-train_idx,]
+users2 <- unique(d$user_id)
+tr_u  <- sample(users2, floor(0.8 * length(users2)))      # split by USER, not by row
+train <- d[d$user_id %in% tr_u, ]; test <- d[!d$user_id %in% tr_u, ]
 
 form <- remaining_steps ~ touch_order + time_elapsed + n_distinct_channels_so_far + is_repeat_channel + channel + visit_number
 
@@ -503,11 +636,10 @@ path_durations <- journey_full %>%
   summarise(duration = max(time_till_session_end), .groups = "drop")
 
 paths <- paths %>% left_join(path_durations, by = c("user_id","session_id")) %>%
-  # ntile() (quartiles) instead of cut() on quantiles - avoids errors from duplicate breakpoints
-  # (many sessions have duration = 0, so quantile-based cut() breaks are often not unique)
-  mutate(duration_bucket = ntile(duration, 4),
-         duration_bucket = factor(duration_bucket, levels = 1:4,
-                                  labels = c("Shortest 25%","25-50%","50-75%","Longest 25%")))
+  # fixed cutpoints: about 43% of sessions have duration 0, so ntile() would split those ties arbitrarily
+  mutate(duration_bucket = cut(duration, c(-Inf, 0, 96, 288, Inf),
+                               labels = c("0 (single touch)", "1-96", "97-288", "289+")))
+print(table(paths$duration_bucket))
 
 by_duration <- lapply(split(paths, paths$duration_bucket), run_markov, channels = channels)
 by_duration_df <- bind_rows(lapply(names(by_duration), function(nm) by_duration[[nm]] %>% mutate(duration_bucket = nm)))
@@ -577,7 +709,8 @@ print(consistency_check)
 heur <- read.csv(OUT("attribution_heuristics.csv"))
 markov <- read.csv(OUT("attribution_markov.csv")) %>% dplyr::select(channel, pct) %>% mutate(method="Markov removal-effect")
 combo <- bind_rows(heur %>% dplyr::select(channel, pct, method), markov)
-combo$method <- factor(combo$method, levels=c("First-touch","Last-touch","Linear","Markov removal-effect"))
+combo$method <- factor(combo$method,
+                       levels = c("First-touch", "Last-touch", "Linear", "Time-decay", "Markov removal-effect"))
 
 p <- ggplot(combo, aes(x=reorder(channel, pct, FUN=median), y=pct, fill=method)) +
   geom_col(position="dodge") +
@@ -596,5 +729,14 @@ p2 <- ggplot(by_len_long, aes(x=len_bucket, y=pct, color=channel, group=channel)
   labs(title="Markov Attribution by Journey Length", x="Journey length (touches)", y="Attribution (%)", color=NULL) +
   theme_minimal(base_size=12)
 ggsave(FIG("attribution_by_length.png"), p2, width=8, height=5, dpi=150)
+
+write.csv(res_table,         OUT("model1_final_results.csv"), row.names = FALSE)
+write.csv(importance_table,  OUT("model1_importance.csv"),    row.names = FALSE)
+write.csv(touch_table,       OUT("model1_touch_table.csv"),   row.names = FALSE)
+write.csv(gap_table,         OUT("model1_gap_table.csv"),     row.names = FALSE)
+
+markov_vs_presence <- markov_attr %>% mutate(pct = round(pct, 2)) %>% left_join(presence, by = "channel")
+write.csv(markov_vs_presence, OUT("attribution_markov_vs_presence.csv"), row.names = FALSE)
+write.csv(conv_by_channel,    OUT("attribution_conv_by_channel.csv"),    row.names = FALSE)
 
 cat("\nALL DONE. Check the 'outputs' and 'figs' subfolders inside:\n", BASE_DIR, "\n")
