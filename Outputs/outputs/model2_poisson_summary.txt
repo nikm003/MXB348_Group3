@@ -1,0 +1,33 @@
+
+Call:
+glm(formula = form, family = poisson(), data = train)
+
+Coefficients:
+                             Estimate Std. Error z value Pr(>|z|)    
+(Intercept)                 2.567e-01  5.412e-03  47.441  < 2e-16 ***
+touch_order                -2.239e-03  2.298e-03  -0.974  0.32994    
+time_elapsed               -1.309e-05  9.377e-06  -1.396  0.16279    
+n_distinct_channels_so_far  4.262e-03  2.825e-03   1.508  0.13148    
+is_repeat_channel          -2.028e-03  4.183e-03  -0.485  0.62787    
+channelEmail Marketing     -2.030e-02  6.381e-03  -3.181  0.00147 ** 
+channelFacebook            -5.561e-03  4.725e-03  -1.177  0.23925    
+channelGoogle Display      -1.236e-02  6.351e-03  -1.946  0.05163 .  
+channelGoogle Search       -8.797e-03  4.495e-03  -1.957  0.05032 .  
+channelInstagram           -7.807e-03  6.330e-03  -1.233  0.21742    
+channelOrganic             -3.331e-03  4.268e-03  -0.780  0.43512    
+channelYoutube              6.975e-03  6.321e-03   1.103  0.26983    
+visit_number                2.956e-05  4.458e-04   0.066  0.94713    
+---
+Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+
+(Dispersion parameter for poisson family taken to be 1)
+
+    Null deviance: 1133107  on 550250  degrees of freedom
+Residual deviance: 1133074  on 550238  degrees of freedom
+AIC: 1925755
+
+Number of Fisher Scoring iterations: 5
+
+
+Dispersion statistic (Pearson chisq / df): 2.279 
+(Values >> 1 indicate overdispersion -> Poisson SEs are too small -> use Negative Binomial)

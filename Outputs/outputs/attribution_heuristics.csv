@@ -1,0 +1,33 @@
+"channel","credit","method","pct"
+"Direct",31602,"First-touch",10.5348779064922
+"Email Marketing",15642,"First-touch",5.21443453621135
+"Facebook",47427,"First-touch",15.8103175264605
+"Google Display",15787,"First-touch",5.26277189765814
+"Google Search",63507,"First-touch",21.1707642303525
+"Instagram",15777,"First-touch",5.25943828652388
+"Organic",94513,"First-touch",31.5069589132428
+"Youtube",15720,"First-touch",5.24043670305859
+"Direct",31454,"Last-touch",10.4855404617051
+"Email Marketing",15761,"Last-touch",5.25410450870906
+"Facebook",47641,"Last-touch",15.8816568047337
+"Google Display",15813,"Last-touch",5.27143928660722
+"Google Search",63064,"Last-touch",21.0230852571048
+"Instagram",15999,"Last-touch",5.33344445370447
+"Organic",94738,"Last-touch",31.5819651637636
+"Youtube",15505,"Last-touch",5.16876406367197
+"Direct",31461.0404675132,"Linear",10.4878874797944
+"Email Marketing",15694.8129686189,"Linear",5.2320403262335
+"Facebook",47483.4542875511,"Linear",15.8291371906163
+"Google Display",15834.0610642797,"Linear",5.27846022644544
+"Google Search",63304.5927691804,"Linear",21.103289530521
+"Instagram",15906.5084701032,"Linear",5.30261137431558
+"Organic",94650.0055082946,"Linear",31.5526312220334
+"Youtube",15640.5244644588,"Linear",5.21394265004045
+"Direct",31434.3625619041,"Time-decay",10.4789941034766
+"Email Marketing",15778.0919459297,"Time-decay",5.25980229883481
+"Facebook",47545.0108079828,"Time-decay",15.849657740806
+"Google Display",15809.1241139554,"Time-decay",5.27014721691989
+"Google Search",63190.0268741012,"Time-decay",21.0650977161767
+"Instagram",15956.9492004405,"Time-decay",5.31942635234285
+"Organic",94662.2197823138,"Time-decay",31.5567029860201
+"Youtube",15599.2147133725,"Time-decay",5.20017158542295

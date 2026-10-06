@@ -1,0 +1,52 @@
+
+Call:
+glm(formula = form, family = binomial(), data = train)
+
+Coefficients:
+                               Estimate Std. Error z value Pr(>|z|)    
+(Intercept)                   4.901e-01  1.709e-02  28.681  < 2e-16 ***
+visit_number                 -9.718e-03  1.396e-03  -6.959 3.42e-12 ***
+prior_conv_rate              -1.530e-01  1.133e-02 -13.510  < 2e-16 ***
+prior_avg_touches             1.049e-02  1.660e-02   0.632    0.527    
+prior_avg_duration           -9.569e-07  4.252e-05  -0.023    0.982    
+entry_channelEmail Marketing  6.883e-03  1.840e-02   0.374    0.708    
+entry_channelFacebook         8.288e-03  1.364e-02   0.607    0.544    
+entry_channelGoogle Display   1.448e-02  1.840e-02   0.787    0.431    
+entry_channelGoogle Search    1.193e-02  1.294e-02   0.922    0.357    
+entry_channelInstagram       -2.361e-02  1.822e-02  -1.295    0.195    
+entry_channelOrganic          5.813e-03  1.220e-02   0.476    0.634    
+entry_channelYoutube          6.806e-03  1.838e-02   0.370    0.711    
+prior_Direct_share           -1.798e-02  1.929e-02  -0.932    0.351    
+prior_Email.Marketing_share  -1.521e-03  2.224e-02  -0.068    0.945    
+prior_Facebook_share         -8.583e-03  1.818e-02  -0.472    0.637    
+prior_Google.Display_share   -2.243e-02  2.224e-02  -1.008    0.313    
+prior_Google.Search_share    -1.809e-02  1.765e-02  -1.025    0.305    
+prior_Instagram_share        -2.722e-02  2.217e-02  -1.228    0.220    
+prior_Organic_share          -1.578e-02  1.708e-02  -0.924    0.355    
+---
+Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+
+(Dispersion parameter for binomial family taken to be 1)
+
+    Null deviance: 475002  on 350028  degrees of freedom
+Residual deviance: 474761  on 350010  degrees of freedom
+AIC: 474799
+
+Number of Fisher Scoring iterations: 4
+
+
+
+VIF check (values > 5 flag concerning multicollinearity):
+                                 GVIF Df GVIF^(1/(2*Df))
+visit_number                 1.000056  1        1.000028
+prior_conv_rate              1.000608  1        1.000304
+prior_avg_touches           27.922761  1        5.284199
+prior_avg_duration           3.812221  1        1.952491
+entry_channel                1.000205  7        1.000015
+prior_Direct_share           3.091905  1        1.758381
+prior_Email.Marketing_share  2.026932  1        1.423704
+prior_Facebook_share         4.274260  1        2.067428
+prior_Google.Display_share   2.056291  1        1.433977
+prior_Google.Search_share    5.373742  1        2.318133
+prior_Instagram_share        2.062034  1        1.435978
+prior_Organic_share          7.849146  1        2.801633

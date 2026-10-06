@@ -1,0 +1,4 @@
+Test AUC: 0.5128 
+Test Brier score (model): 0.2431 
+Test Brier score (naive baseline = overall rate): 0.2432 
+Baseline (train) conversion rate used: 0.5853 

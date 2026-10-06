@@ -1,0 +1,13 @@
+Touchpoints: 1179921 
+Sessions: 510496 
+Users: 72959 
+Overall session-level conversion rate: 0.5876 
+
+Sessions per user summary:
+   Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+  1.000   5.000   7.000   6.997   9.000  22.000 
+
+Share of users with 1 vs 2+ sessions:
+
+  1 session 2+ sessions 
+        178       72781 
