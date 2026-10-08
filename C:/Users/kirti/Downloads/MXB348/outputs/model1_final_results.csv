@@ -1,0 +1,7 @@
+"model","uses_current_sess","mean_auc","sd_auc","change_vs_baseline","beats_baseline_pct"
+"glm_baseline","no",0.5141,6e-04,0,0
+"glm_start","no",0.5212,0.0015,0.0071,100
+"glm_end","yes",0.5266,0.002,0.0125,100
+"glm_end_curve","yes",0.529,0.0021,0.0149,100
+"xgb_start","no",0.5216,0.001,0.0075,100
+"xgb_end","yes",0.5339,0.002,0.0198,100

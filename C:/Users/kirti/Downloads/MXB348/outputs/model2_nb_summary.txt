@@ -1,0 +1,38 @@
+
+Call:
+glm.nb(formula = form, data = train, init.theta = 1.006504299, 
+    link = log)
+
+Coefficients:
+                             Estimate Std. Error z value Pr(>|z|)    
+(Intercept)                 2.567e-01  8.175e-03  31.403   <2e-16 ***
+touch_order                -2.261e-03  3.461e-03  -0.653   0.5135    
+time_elapsed               -1.311e-05  1.414e-05  -0.928   0.3536    
+n_distinct_channels_so_far  4.297e-03  4.259e-03   1.009   0.3129    
+is_repeat_channel          -2.005e-03  6.308e-03  -0.318   0.7505    
+channelEmail Marketing     -2.035e-02  9.617e-03  -2.116   0.0343 *  
+channelFacebook            -5.584e-03  7.143e-03  -0.782   0.4344    
+channelGoogle Display      -1.239e-02  9.586e-03  -1.293   0.1961    
+channelGoogle Search       -8.812e-03  6.794e-03  -1.297   0.1946    
+channelInstagram           -7.824e-03  9.562e-03  -0.818   0.4133    
+channelOrganic             -3.351e-03  6.455e-03  -0.519   0.6037    
+channelYoutube              6.960e-03  9.575e-03   0.727   0.4673    
+visit_number                3.046e-05  6.733e-04   0.045   0.9639    
+---
+Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+
+(Dispersion parameter for Negative Binomial(1.0065) family taken to be 1)
+
+    Null deviance: 565866  on 550250  degrees of freedom
+Residual deviance: 565852  on 550238  degrees of freedom
+AIC: 1725974
+
+Number of Fisher Scoring iterations: 1
+
+
+              Theta:  1.00650 
+          Std. Err.:  0.00412 
+
+ 2 x log-likelihood:  -1725946.09200 
+
+Estimated theta (dispersion parameter): 1.006504 

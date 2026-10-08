@@ -1,0 +1,18 @@
+"term","Estimate","Std..Error","z.value","Pr...z.."
+"(Intercept)",0.5842,0.0398,14.6611,0
+"visit_number",-0.0111,0.0016,-6.9625,0
+"ewma_conv_02",-0.2332,0.2418,-0.9642,0.3349
+"ewma_conv_05",-0.2743,0.2931,-0.9358,0.3494
+"ewma_conv_08",-0.1215,0.2967,-0.4095,0.6822
+"last_converted",0.0961,0.131,0.7338,0.4631
+"sessions_since_conv",-0.0031,0.002,-1.5063,0.132
+"conv_smooth",0.265,0.0897,2.9525,0.0032
+"ewma_touches",-0.0055,0.0069,-0.8011,0.4231
+"ewma_duration",0,0,-0.2827,0.7774
+"entry_channelEmail Marketing",-0.0084,0.0184,-0.4549,0.6492
+"entry_channelFacebook",-0.0159,0.0137,-1.1612,0.2455
+"entry_channelGoogle Display",-0.0108,0.0184,-0.5892,0.5557
+"entry_channelGoogle Search",-0.0022,0.013,-0.1735,0.8623
+"entry_channelInstagram",-0.0243,0.0183,-1.3286,0.184
+"entry_channelOrganic",-0.0053,0.0122,-0.4345,0.664
+"entry_channelYoutube",-0.0087,0.0184,-0.4711,0.6376
