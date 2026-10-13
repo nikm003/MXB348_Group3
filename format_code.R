@@ -34,7 +34,7 @@ journey_formatted <- journey %>%
 final_data <- journey_formatted %>%
   left_join(
     results %>%
-      select(user_id, session_id, conversion),
+      dplyr::select(user_id, session_id, conversion),
     by = c("user_id", "session_id")
   ) %>%
   arrange(user_id, session_id)
@@ -46,3 +46,4 @@ write_xlsx(
   final_data,
   "formatted_data.xlsx"
 )
+
