@@ -128,7 +128,6 @@ cat("EDA done\n")
 suppressMessages({ library(dplyr); library(tidyr) })
 if (!requireNamespace("xgboost", quietly = TRUE)) install.packages("xgboost")
 
-
 # Helpers
 
 # AUC via the Mann-Whitney identity. as.numeric() avoids integer overflow,
@@ -142,7 +141,6 @@ auc_fast <- function(labels, scores) {
 
 channels <- sort(unique(journey_full$channel))
 ch_cols  <- make.names(channels)        # "Email Marketing" -> "Email.Marketing"
-
 
 # One row per session: current-session features
 
@@ -181,7 +179,6 @@ sess <- sess %>% mutate(
   lmean    = log1p(mean_gap)
 )
 
-
 # Per-user HISTORY features (only strictly earlier sessions)
 
 # NOTE: these global means are computed on all sessions (incl. future test users).
@@ -211,7 +208,7 @@ sess <- sess %>%
     visit_number   = row_number(),
     prior_sessions = visit_number - 1,
     
-    # ---- baseline features (your original Model 1 feature set) ----
+    # baseline features (your original Model 1 feature set)
     prior_conv_rate    = ifelse(prior_sessions > 0,
                                 lag(cumsum(conversion), default = 0) / prior_sessions, NA_real_),
     prior_avg_touches  = lag(cummean(n_touches), default = NA_real_),
@@ -241,7 +238,6 @@ users <- unique(d$user_id)
 cat("Return-visit rows:", nrow(d), " Users:", length(users),
     " Conversion rate:", round(mean(d$conversion), 4), "\n")
 
-
 # Feature sets
 
 # baseline = original features (Youtube share dropped: shares sum to 1 -> collinear)
@@ -267,7 +263,6 @@ end_curve_vars <- c(setdiff(end_vars, c("n_repeats", has_cols[length(has_cols)],
 # glm version of plain END (linear terms), also collinearity-safe
 end_glm_vars <- setdiff(end_vars, c("n_repeats", has_cols[length(has_cols)]))
 
-
 # Model functions (each returns test AUC)
 
 glm_auc <- function(vars, tr, te) {
@@ -289,7 +284,6 @@ xgb_auc <- function(vars, tr, te) {
   m   <- xgboost::xgb.train(params = xgb_params, data = dtr, nrounds = 200, verbose = 0)
   auc_fast(te$conversion, predict(m, dte))
 }
-
 
 # Repeated USER-LEVEL splits (no user appears in both train and test)
 
@@ -321,7 +315,6 @@ res_table <- data.frame(
   beats_baseline_pct = round(100 * colMeans(res > res[, "glm_baseline"]))
 )
 print(res_table, row.names = FALSE)
-
 
 # Features boosted model use
 
@@ -371,6 +364,9 @@ write.csv(single_perf, OUT("model1_single_performance.csv"), row.names = FALSE)
 write.csv(calib_final, OUT("model1_calibration.csv"),        row.names = FALSE)
 write.csv(coef_table,  OUT("model1_coefficients.csv"),       row.names = FALSE)
 
+d_m1 <- d   # copy of the Model 1 return-visit table, kept for checks
+
+
 # MODEL 2 — feature engineering: steps to conversion
 
 sess_info <- journey_full %>%
@@ -409,7 +405,6 @@ print(summary(model2_df$remaining_steps))
 cat("Mean:", mean(model2_df$remaining_steps), " Var:", var(model2_df$remaining_steps), "\n")
 
 write.csv(head(model2_df, 200), OUT("model2_features_preview.csv"), row.names = FALSE)
-
 
 # MODEL 2 — fit Poisson + Negative Binomial
 
@@ -459,6 +454,175 @@ write.csv(perf, OUT("model2_performance.csv"), row.names = FALSE)
 
 saveRDS(pois_fit, DATA("model2_pois_fit.rds"))
 saveRDS(nb_fit, DATA("model2_nb_fit.rds"))
+
+# Model 2 checks
+
+# hazard: P(touch is the last one | session reached it); flat means memoryless
+cat("Pooled P(last touch):", round(mean(model2_df$remaining_steps == 0), 4),
+    " geometric prediction:", round(1 / (1 + mean(model2_df$remaining_steps)), 4), "\n")
+hz <- model2_df %>% mutate(is_last = remaining_steps == 0)
+hazard_pos     <- hz %>% mutate(position = pmin(touch_order, 7)) %>% group_by(position) %>% summarise(P_last = round(mean(is_last), 4), n = n())
+hazard_channel <- hz %>% group_by(channel) %>% summarise(P_last = round(mean(is_last), 4), n = n())
+hazard_repeat  <- hz %>% group_by(is_repeat_channel) %>% summarise(P_last = round(mean(is_last), 4), n = n())
+print(hazard_pos); print(hazard_channel); print(hazard_repeat)
+
+# session lengths: geometric means a constant ratio between neighbouring lengths
+len_tab <- model2_df %>% group_by(user_id, session_id) %>% summarise(L = n(), .groups = "drop") %>% count(L) %>% arrange(L) %>% filter(L <= 8)
+len_tab$ratio_to_prev <- round(len_tab$n / dplyr::lag(len_tab$n), 3)
+print(len_tab)
+
+# test log-likelihood per row, RMSE cannot separate these models
+y   <- test$remaining_steps
+mu0 <- mean(train$remaining_steps)
+nb0 <- MASS::glm.nb(remaining_steps ~ 1, data = train)   # intercept-only NB; theta near 1 means geometric
+cat("Intercept-only NB theta:", round(nb0$theta, 3), " Full NB theta:", round(nb_fit$theta, 3), "\n")
+loglik_table <- data.frame(
+  model = c("Poisson, constant mean", "Geometric, constant mean", "NB, constant mean", "Poisson, with features", "NB, with features"),
+  mean_loglik = round(c(mean(dpois(y, mu0, log = TRUE)),
+                        mean(dgeom(y, 1 / (1 + mu0), log = TRUE)),
+                        mean(dnbinom(y, size = nb0$theta, mu = mu0, log = TRUE)),
+                        mean(dpois(y, test$pred_pois, log = TRUE)),
+                        mean(dnbinom(y, size = nb_fit$theta, mu = test$pred_nb, log = TRUE))), 5))
+print(loglik_table, row.names = FALSE)
+
+# hazard model: can any feature predict that a touch is the last one (AUC near 0.5 means no)
+tr_h <- train; tr_h$is_last <- as.integer(tr_h$remaining_steps == 0)
+te_h <- test;  te_h$is_last <- as.integer(te_h$remaining_steps == 0)
+hz_fit <- glm(is_last ~ touch_order + time_elapsed + n_distinct_channels_so_far + is_repeat_channel + channel + visit_number, data = tr_h, family = binomial())
+cat("Hazard model test AUC:", round(auc_fast(te_h$is_last, predict(hz_fit, te_h, type = "response")), 4), "\n")
+
+# Poisson coefficients with standard errors clustered by user
+if (!requireNamespace("sandwich", quietly = TRUE)) install.packages("sandwich")
+V  <- sandwich::vcovCL(pois_fit, cluster = train$user_id)
+cf <- coef(pois_fit); se <- sqrt(diag(V))
+robust_tab <- data.frame(term = names(cf), estimate = round(cf, 4), robust_se = round(se, 4), p_robust = signif(2 * pnorm(-abs(cf / se)), 3), row.names = NULL)
+print(robust_tab)
+
+# geometric fit on all data: P(k touches left) = p * (1 - p)^k with p = 1 / (1 + mean)
+all_y <- model2_df$remaining_steps
+p_all <- 1 / (1 + mean(all_y))
+fit_check_full <- data.frame(remaining = 0:5, observed = round(sapply(0:5, function(k) mean(all_y == k)), 4), geometric = round(dgeom(0:5, p_all), 4))
+fit_check_full$diff <- round(fit_check_full$observed - fit_check_full$geometric, 4)
+print(fit_check_full)
+
+# save tables for the report
+write.csv(hazard_pos,     OUT("model2_hazard_by_position.csv"),    row.names = FALSE)
+write.csv(hazard_channel, OUT("model2_hazard_by_channel.csv"),     row.names = FALSE)
+write.csv(hazard_repeat,  OUT("model2_hazard_by_repeat.csv"),      row.names = FALSE)
+write.csv(len_tab,        OUT("model2_session_length_ratios.csv"), row.names = FALSE)
+write.csv(loglik_table,   OUT("model2_loglik_comparison.csv"),     row.names = FALSE)
+write.csv(robust_tab,     OUT("model2_poisson_robust_coefs.csv"),  row.names = FALSE)
+write.csv(fit_check_full, OUT("model2_geometric_fit.csv"),         row.names = FALSE)
+
+# Objective 2
+# Lifecycle stages
+suppressMessages({ library(dplyr); library(tidyr) })
+if (!exists("auc_fast")) auc_fast <- function(labels, scores) { pos <- scores[labels == 1]; neg <- scores[labels == 0]; n1 <- as.numeric(length(pos)); n0 <- as.numeric(length(neg)); (sum(rank(c(pos, neg))[seq_len(n1)]) - n1 * (n1 + 1) / 2) / (n1 * n0) }
+
+# one row per session in time order (a larger session_id is more recent, per the data dictionary)
+visits <- journey_full %>% distinct(user_id, session_id, conversion) %>% arrange(user_id, session_id)
+stage_labels <- c("New", "Exploring", "Active", "Lapsing")
+
+# label each visit using only EARLIER visits; k = how many of the latest visits count as "recent"
+label_visits <- function(df, k) {
+  df %>% group_by(user_id) %>%
+    mutate(visit_number = row_number(),
+           cs          = cumsum(conversion),
+           past_conv   = lag(cs, 1, default = 0),                       # conversions in visits 1..t-1
+           recent_conv = past_conv - lag(cs, k + 1, default = 0),       # conversions in visits t-k..t-1
+           stage = factor(case_when(visit_number == 1 ~ "New",          # no history yet
+                                    past_conv == 0    ~ "Exploring",    # history, never converted
+                                    recent_conv > 0   ~ "Active",       # converted within the last k visits
+                                    TRUE              ~ "Lapsing"),     # converted before, but not recently
+                          levels = stage_labels)) %>%
+    ungroup()
+}
+
+# k is fixed in advance at 2 (the two latest visits); sensitivity to k is checked below
+K <- 2
+lab <- label_visits(visits, K)
+stopifnot(!anyNA(lab$stage))   # every visit gets exactly one label: mutually exclusive and exhaustive by construction
+
+# how many visits fall in each stage
+stage_sizes <- lab %>% count(stage) %>% mutate(share_pct = round(100 * n / sum(n), 1))
+print(stage_sizes)
+
+# Wilson 95% interval for a proportion (vectorised)
+wilson <- function(x, n, side, z = 1.96) { p <- x / n; d <- 1 + z^2 / n; ctr <- (p + z^2 / (2 * n)) / d; h <- z * sqrt(p * (1 - p) / n + z^2 / (4 * n^2)) / d; if (side == "low") ctr - h else ctr + h }
+
+# validation 1: conversion rate of the labelled visit by stage (interval ignores within-customer correlation, so it is optimistic)
+stage_validation <- lab %>% group_by(stage) %>% summarise(visits = n(), converted = sum(conversion), .groups = "drop") %>%
+  mutate(conv_rate = converted / visits, ci_low = wilson(converted, visits, "low"), ci_high = wilson(converted, visits, "high")) %>%
+  mutate(across(c(conv_rate, ci_low, ci_high), ~ round(.x, 4)))
+print(stage_validation)
+
+# validation 2: chi-squared test of independence plus Cramer's V (with this many rows even tiny gaps are significant, so read V)
+tab <- table(lab$stage, lab$conversion)
+chi <- chisq.test(tab)
+cramers_v <- sqrt(unname(chi$statistic) / (sum(tab) * (min(dim(tab)) - 1)))
+cat("Chi-squared:", round(unname(chi$statistic), 1), " df:", unname(chi$parameter), " p:", signif(chi$p.value, 3), " Cramer's V:", round(cramers_v, 4), "\n")
+
+# validation 3: the stage alone as a forecaster of return visits, scored with AUC on held-out customers (compare with Model 1: 0.5141 baseline, 0.5212 history)
+label_auc <- function(l, reps = 5) {
+  ret <- l %>% filter(visit_number >= 2); ret_users <- unique(ret$user_id)
+  sapply(seq_len(reps), function(r) { set.seed(r); tr_u <- sample(ret_users, floor(0.8 * length(ret_users)))
+  tr <- ret[ret$user_id %in% tr_u, ]; te <- ret[!ret$user_id %in% tr_u, ]
+  rate <- tr %>% group_by(stage) %>% summarise(p = mean(conversion), .groups = "drop")
+  auc_fast(te$conversion, rate$p[match(te$stage, rate$stage)]) })
+}
+auc_vals <- label_auc(lab)
+cat("Stage-only AUC over 5 customer-level splits: mean", round(mean(auc_vals), 4), " sd", round(sd(auc_vals), 4), "\n")
+
+# validation 4: sensitivity to k (how many latest visits count as recent)
+k_sensitivity <- bind_rows(lapply(1:3, function(k) {
+  l <- label_visits(visits, k); tb <- table(l$stage, l$conversion); ch <- suppressWarnings(chisq.test(tb)); ret <- l %>% filter(visit_number >= 2)
+  data.frame(k = k, active_pct = round(100 * mean(ret$stage == "Active"), 1), lapsing_pct = round(100 * mean(ret$stage == "Lapsing"), 1),
+             cramers_v = round(sqrt(unname(ch$statistic) / (sum(tb) * (min(dim(tb)) - 1))), 4), mean_auc = round(mean(label_auc(l)), 4)) }))
+print(k_sensitivity)
+
+# how customers move between stages from one visit to the next (row percentages)
+transitions <- lab %>% group_by(user_id) %>% mutate(next_stage = lead(stage)) %>% ungroup() %>% filter(!is.na(next_stage)) %>%
+  count(stage, next_stage) %>% group_by(stage) %>% mutate(pct = round(100 * n / sum(n), 1)) %>% ungroup() %>%
+  dplyr::select(-n) %>% pivot_wider(names_from = next_stage, values_from = pct, values_fill = 0)
+print(transitions)
+
+# each customer's current stage after their last observed visit (the label to use for their next visit)
+customer_stage <- visits %>% group_by(user_id) %>%
+  summarise(n_visits = n(), total_conv = sum(conversion), recent_conv = sum(tail(conversion, K)), .groups = "drop") %>%
+  mutate(current_stage = factor(case_when(total_conv == 0 ~ "Exploring", recent_conv > 0 ~ "Active", TRUE ~ "Lapsing"), levels = c("Exploring", "Active", "Lapsing")))
+current_stage_sizes <- customer_stage %>% count(current_stage) %>% mutate(share_pct = round(100 * n / sum(n), 1))
+print(current_stage_sizes)
+
+# Recency direction checks
+
+# conversion on a visit by whether the customer's previous visit converted
+recency_last <- d_m1 %>% group_by(last_converted) %>% summarise(rate = round(mean(conversion), 4), n = n())
+print(recency_last)
+
+# conversion by fifths of the recency-weighted past conversion score (decay 0.8)
+recency_ewma <- d_m1 %>% mutate(fifth = ntile(ewma_conv_08, 5)) %>% group_by(fifth) %>% summarise(rate = round(mean(conversion), 4), n = n())
+print(recency_ewma)
+
+# the same comparison within each visit number, to rule out visit number as the explanation
+recency_by_visit <- d_m1 %>% mutate(visit = pmin(visit_number, 6)) %>% group_by(visit, last_converted) %>% summarise(rate = round(mean(conversion), 3), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = last_converted, values_from = rate, names_prefix = "last_converted_")
+print(recency_by_visit)
+
+# stage comparison within each visit number (Lapsing cannot occur before visit 4, hence the NAs)
+stage_by_visit <- lab %>% filter(visit_number >= 2) %>% mutate(visit = pmin(visit_number, 6)) %>% group_by(visit, stage) %>% summarise(rate = round(mean(conversion), 3), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = stage, values_from = rate)
+print(stage_by_visit)
+
+# save the tables for the report
+write.csv(recency_last,     OUT("recency_last_converted.csv"), row.names = FALSE)
+write.csv(recency_ewma,     OUT("recency_ewma_fifths.csv"),    row.names = FALSE)
+write.csv(recency_by_visit, OUT("recency_by_visit.csv"),       row.names = FALSE)
+write.csv(stage_by_visit,   OUT("stage_by_visit.csv"),         row.names = FALSE)
+write.csv(stage_sizes,         OUT("stage_sizes.csv"),         row.names = FALSE)
+write.csv(stage_validation,    OUT("stage_validation.csv"),    row.names = FALSE)
+write.csv(k_sensitivity,       OUT("stage_k_sensitivity.csv"), row.names = FALSE)
+write.csv(transitions,         OUT("stage_transitions.csv"),   row.names = FALSE)
+write.csv(current_stage_sizes, OUT("stage_current_sizes.csv"), row.names = FALSE)
 
 
 # BUSINESS ATTRIBUTION — overall rate + heuristics + Markov
