@@ -1,4 +1,4 @@
-BASE_DIR <- "C:/Users/kirti/Downloads/MXB348"
+BASE_DIR <- "."
 xlsx_path <- file.path(BASE_DIR, "formatted_data.xlsx")
 
 dir.create(file.path(BASE_DIR, "outputs"), showWarnings = FALSE, recursive = TRUE)
